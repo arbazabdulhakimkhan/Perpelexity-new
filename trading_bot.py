@@ -708,7 +708,7 @@ def worker(symbol):
 # DAILY SUMMARY
 # =========================
 def ist_now():
-    return datetime.now(timezone(timedelta(hours=5, minutes=30))))
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
 def generate_daily_summary():
     try:
@@ -831,3 +831,4 @@ Max Position: {MAX_POSITION_PCT*100:.0f}% of capital
 
 if __name__ == "__main__":
     main()
+
