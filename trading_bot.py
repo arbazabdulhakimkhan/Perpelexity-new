@@ -1,12 +1,4 @@
-# trading_bot.py - MERGED: original fixes + Option B upgrades
-# - Adds EMA20/EMA50 trend filter
-# - Adds ATR_SMA low/high volatility filters (skip trades)
-# - Adds continuation entry (momentum + pullback) with original sweep fallback
-# - Adds breakeven SL (move SL to entry after 1R)
-# - Adds TP1 partial (50% at 1R)
-# - Funding left configurable (env), default OFF for scalping
-# - Preserves previous fixes and structure
-
+# trading_bot.py - CORRECTED VERSION with 15 bug fixes
 import os, time, json, traceback, threading
 from datetime import datetime, timedelta, timezone
 import ccxt
@@ -24,24 +16,24 @@ SYMBOLS = [s.strip() for s in os.getenv(
     "ARB/USDT:USDT,LINK/USDT:USDT,SOL/USDT:USDT,ETH/USDT:USDT,BTC/USDT:USDT"
 ).split(",") if s.strip()]
 
-ENTRY_TF = os.getenv("ENTRY_TF", "5m")
-HTF = os.getenv("HTF", "15m")
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "10"))
+ENTRY_TF = os.getenv("ENTRY_TF", "1h")
+HTF = os.getenv("HTF", "4h")
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
 
 TOTAL_PORTFOLIO_CAPITAL = float(os.getenv("TOTAL_PORTFOLIO_CAPITAL", "10000"))
 PER_COIN_ALLOCATION = float(os.getenv("PER_COIN_ALLOCATION", "0.20"))
 PER_COIN_CAP_USD = TOTAL_PORTFOLIO_CAPITAL * PER_COIN_ALLOCATION
 
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.03"))
-RR_FIXED = float(os.getenv("RR_FIXED", "2.0"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.02"))
+RR_FIXED = float(os.getenv("RR_FIXED", "5.0"))
 DYNAMIC_RR = os.getenv("DYNAMIC_RR", "true").lower() == "true"
-MIN_RR = float(os.getenv("MIN_RR", "2.0"))
-MAX_RR = float(os.getenv("MAX_RR", "3.0"))
+MIN_RR = float(os.getenv("MIN_RR", "4.0"))
+MAX_RR = float(os.getenv("MAX_RR", "6.0"))
 
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "2.5"))
+ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.5"))
 USE_ATR_STOPS = os.getenv("USE_ATR_STOPS", "true").lower() == "true"
-USE_H1_FILTER = os.getenv("USE_H1_FILTER", "false").lower() == "true"
+USE_H1_FILTER = os.getenv("USE_H1_FILTER", "true").lower() == "true"
 
 USE_VOLUME_FILTER = os.getenv("USE_VOLUME_FILTER", "false").lower() == "true"
 VOL_LOOKBACK = int(os.getenv("VOL_LOOKBACK", "20"))
@@ -49,15 +41,15 @@ VOL_MIN_RATIO = float(os.getenv("VOL_MIN_RATIO", "0.5"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "25"))
 RSI_OVERBOUGHT = 100 - RSI_OVERSOLD
-BIAS_CONFIRM_BEAR = int(os.getenv("BIAS_CONFIRM_BEAR", "3"))  # tuned for higher TFs or small TFs; default 3
+BIAS_CONFIRM_BEAR = int(os.getenv("BIAS_CONFIRM_BEAR", "8"))  # ✅ FIX #12: Changed default from 2 to 8
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "0.0"))
 
 MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.20"))
 MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "100000"))
 SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0005"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0006"))
-INCLUDE_FUNDING = os.getenv("INCLUDE_FUNDING", "false").lower() == "true"  # default OFF for scalping
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "1.0"))
+INCLUDE_FUNDING = os.getenv("INCLUDE_FUNDING", "true").lower() == "true"
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.5"))  # ✅ FIX #9: New parameter
 
 TELEGRAM_TOKEN_FUT = os.getenv("TELEGRAM_TOKEN_FUT", "")
 TELEGRAM_CHAT_ID_FUT = os.getenv("TELEGRAM_CHAT_ID_FUT", "")
@@ -202,15 +194,12 @@ def calculate_atr(df, period=14):
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def calculate_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
 # ✅ FIX #9: Added max_position_pct parameter
 def position_size_futures(price, sl, capital, risk_percent, max_trade_size, max_position_pct=0.5):
     risk_per_trade = capital * risk_percent
     rpc = abs(price - sl)
     max_by_risk = (risk_per_trade / rpc) if rpc > 0 else 0
-    max_by_capital = (capital / price) * max_position_pct
+    max_by_capital = (capital / price) * max_position_pct  # ✅ Cap at 50%
     return max(min(max_by_risk, max_by_capital, max_trade_size / price), 0)
 
 # =========================
@@ -231,11 +220,6 @@ def load_state(state_file):
                     s[k] = pd.to_datetime(s[k]).tz_localize(None)
                 except:
                     s[k] = None
-        # ensure new fields exist for partial TP and tp1 flag
-        if "tp1" not in s:
-            s["tp1"] = None
-        if "tp1_hit" not in s:
-            s["tp1_hit"] = False
         return s
     return {
         "capital": PER_COIN_CAP_USD,
@@ -249,9 +233,7 @@ def load_state(state_file):
         "peak_equity": PER_COIN_CAP_USD,
         "last_processed_ts": None,
         "last_exit_time": None,
-        "bearish_count": 0,
-        "tp1": None,
-        "tp1_hit": False
+        "bearish_count": 0
     }
 
 def save_state(state_file, state):
@@ -285,10 +267,7 @@ def avg_fill_price(order):
     return None
 
 def amount_to_precision(exchange, symbol, amt):
-    try:
-        return float(exchange.amount_to_precision(symbol, amt))
-    except Exception:
-        return float(amt)
+    return float(exchange.amount_to_precision(symbol, amt))
 
 # ✅ FIX #13: Added leverage verification
 def verify_leverage(exchange, symbol):
@@ -306,54 +285,30 @@ def verify_leverage(exchange, symbol):
 # =========================
 def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
     h1 = h1.copy(); h4 = h4.copy()
-
-    # bias (1 bar difference)
     h1['Bias'] = 0
     h1.loc[h1['Close'] > h1['Close'].shift(1), 'Bias'] = 1
     h1.loc[h1['Close'] < h1['Close'].shift(1), 'Bias'] = -1
 
-    # 4H trend (for HTF)
     h4['Trend'] = 0
     h4.loc[h4['Close'] > h4['Close'].shift(1), 'Trend'] = 1
     h4.loc[h4['Close'] < h4['Close'].shift(1), 'Trend'] = -1
 
     h1['H4_Trend'] = h4['Trend'].reindex(h1.index, method='ffill').fillna(0).astype(int)
 
-    # --- indicators ---
     if USE_ATR_STOPS:
         h1['ATR'] = calculate_atr(h1, ATR_PERIOD)
-        # ATR_SMA used for volatility regime detection
-        h1['ATR_SMA'] = h1['ATR'].rolling(20).mean()
-
     if USE_VOLUME_FILTER:
         h1['Avg_Volume'] = h1['Volume'].rolling(VOL_LOOKBACK).mean()
-
     h1['RSI'] = calculate_rsi(h1['Close'], RSI_PERIOD)
 
-    # EMAs for trend filter (continuation)
-    h1['EMA20'] = calculate_ema(h1['Close'], 20)
-    h1['EMA50'] = calculate_ema(h1['Close'], 50)
-
     i = len(h1) - 1
-    if i < 1:
-        return state, None
-
     curr = h1.iloc[i]
     prev_close = h1['Close'].iloc[i-1] if i >= 1 else curr['Close']
     price = float(curr['Close']); open_price = float(curr['Open'])
     bias = int(curr['Bias']); h4t = int(curr['H4_Trend'])
     ts = h1.index[i]
 
-    # ===== Volatility regime filters (new) =====
-    atr_now = float(h1['ATR'].iloc[i]) if ('ATR' in h1.columns and not pd.isna(h1['ATR'].iloc[i])) else None
-    atr_sma = float(h1['ATR_SMA'].iloc[i]) if ('ATR_SMA' in h1.columns and not pd.isna(h1['ATR_SMA'].iloc[i])) else None
-    low_vol = False
-    high_vol = False
-    if atr_now is not None and atr_sma is not None:
-        low_vol = atr_now < (atr_sma * 0.7)
-        high_vol = atr_now > (atr_sma * 2.0)
-
-    # ✅ FIX #6: Only apply funding on settlement hours (unchanged)
+    # ✅ FIX #6: Only apply funding on settlement hours
     bar_hour = ts.hour
     if bar_hour in [0, 8, 16] and INCLUDE_FUNDING and state["position"] != 0 and funding_series is not None:
         try:
@@ -378,6 +333,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                 send_telegram_fut(f"❌ {symbol} forced-exit failed: {e}")
         gross = state["entry_size"] * (exit_price - state["entry_price"]) * (1 if state["position"]==1 else -1)
         pos_val = abs(exit_price * state["entry_size"])
+        # ✅ FIX #5: Removed slippage deduction
         pnl = gross - pos_val*FEE_RATE
         state["capital"] += pnl
         row = {
@@ -389,68 +345,18 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             "PnL_$": round(pnl,2), "Win": 1 if pnl>0 else 0,
             "Exit_Reason": "MAX DRAWDOWN", "Capital_After": round(state["capital"],2), "Mode": MODE
         }
-        state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"bearish_count":0,"entry_bar_index":0,"tp1":None,"tp1_hit":False})
+        state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"bearish_count":0,"entry_bar_index":0})
         state["last_exit_time"] = ts
         return state, row
 
     trade_row = None
 
-    # =========================
-    # EXIT LOGIC (with breakeven & TP1 partial)
-    # =========================
+    # ===== EXIT LOGIC =====
     if state["position"] != 0:
         # ✅ FIX #1: Check minimum hold period
         bars_held = i - state.get("entry_bar_index", 0)
-
+        
         exit_flag = False; exit_reason = ""; exit_price = price
-
-        # --- BREAKEVEN: move SL to entry after 1R reached ---
-        try:
-            entry = float(state["entry_price"])
-            entry_sl = float(state["entry_sl"])
-            size = float(state["entry_size"])
-            one_r = abs(entry - entry_sl) if entry_sl and entry else None
-            if one_r is not None and bars_held >= 1:
-                if state["position"] == 1:
-                    if price >= entry + one_r:
-                        state["entry_sl"] = entry  # move to breakeven
-                else:
-                    if price <= entry - one_r:
-                        state["entry_sl"] = entry  # move to breakeven
-        except Exception:
-            pass
-
-        # --- TP1 partial (50% at 1R) ---
-        if state.get("tp1") is not None and not state.get("tp1_hit", False):
-            try:
-                tp1 = float(state["tp1"])
-                if (state["position"] == 1 and price >= tp1) or (state["position"] == -1 and price <= tp1):
-                    half_size = state["entry_size"] * 0.5
-                    # execute partial close (live only)
-                    if MODE == "live":
-                        try:
-                            order = place_market(exchange, symbol, "sell" if state["position"]==1 else "buy", amount_to_precision(exchange, symbol, half_size), reduce_only=True)
-                            filled_price = float(avg_fill_price(order) or price)
-                        except Exception as e:
-                            send_telegram_fut(f"❌ {symbol} TP1 partial failed: {e}")
-                            filled_price = price
-                    else:
-                        filled_price = price
-
-                    # account P&L adjustment for closed half
-                    pnl_half = half_size * (filled_price - state["entry_price"]) * (1 if state["position"]==1 else -1)
-                    pos_val = abs(filled_price * half_size)
-                    pnl_half = pnl_half - pos_val * FEE_RATE
-                    state["capital"] += pnl_half
-
-                    state["entry_size"] = state["entry_size"] - half_size
-                    state["tp1_hit"] = True
-                    send_telegram_fut(f"🎯 TP1 HIT {symbol} @ {filled_price:.4f} (50% closed)")
-
-            except Exception:
-                pass
-
-        # normal exit checks (TP or SL or bias/4H reversal after min hold)
         if state["position"] == 1:
             if price >= state["entry_tp"]:
                 exit_flag, exit_price, exit_reason = True, state["entry_tp"], "Take Profit"
@@ -458,7 +364,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             elif price <= state["entry_sl"]:
                 exit_flag, exit_price, exit_reason = True, state["entry_sl"], "Stop Loss"
                 state["bearish_count"] = 0
-            elif bars_held >= 3:
+            elif bars_held >= 3:  # ✅ Only check 4H/Bias after 3 bars
                 if USE_H1_FILTER and (h4t < 0 and bias < 0):
                     exit_flag, exit_price, exit_reason = True, price, "4H Trend Reversal"
                 elif bias < 0:
@@ -466,6 +372,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                     if state["bearish_count"] >= BIAS_CONFIRM_BEAR:
                         exit_flag, exit_price, exit_reason = True, price, "Bias Reversal"
                         state["bearish_count"] = 0
+                # ✅ FIX #2: Don't reset on neutral bias
                 elif bias > 0:
                     state["bearish_count"] = 0
             else:
@@ -477,7 +384,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             elif price >= state["entry_sl"]:
                 exit_flag, exit_price, exit_reason = True, state["entry_sl"], "Stop Loss"
                 state["bearish_count"] = 0
-            elif bars_held >= 3:
+            elif bars_held >= 3:  # ✅ Only check 4H/Bias after 3 bars
                 if USE_H1_FILTER and (h4t > 0 and bias > 0):
                     exit_flag, exit_price, exit_reason = True, price, "4H Trend Reversal"
                 elif bias > 0:
@@ -485,6 +392,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                     if state["bearish_count"] >= BIAS_CONFIRM_BEAR:
                         exit_flag, exit_price, exit_reason = True, price, "Bias Reversal"
                         state["bearish_count"] = 0
+                # ✅ FIX #2: Don't reset on neutral bias
                 elif bias < 0:
                     state["bearish_count"] = 0
             else:
@@ -501,6 +409,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
 
             gross = state["entry_size"] * (exit_price - state["entry_price"]) * (1 if state["position"]==1 else -1)
             pos_val = abs(exit_price * state["entry_size"])
+            # ✅ FIX #5: Removed slippage deduction
             pnl = gross - pos_val*FEE_RATE
             state["capital"] += pnl
 
@@ -513,13 +422,13 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                 "PnL_$": round(pnl,2), "Win": 1 if pnl>0 else 0,
                 "Exit_Reason": exit_reason, "Capital_After": round(state["capital"],2), "Mode": MODE
             }
-            state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"entry_bar_index":0,"tp1":None,"tp1_hit":False})
+            state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"entry_bar_index":0})
             state["last_exit_time"] = ts
 
             emoji = "💚" if pnl>0 else "❤️"
             send_telegram_fut(f"{emoji} EXIT {symbol} {exit_reason} @ {exit_price:.4f} | PnL ${pnl:.2f}")
 
-    # ===== ENTRY LOGIC (continuation + sweep fallback) =====
+    # ===== ENTRY LOGIC =====
     if state["position"] == 0:
         # ✅ FIX #10: Improved cooldown handling
         if COOLDOWN_HOURS>0 and state.get("last_exit_time") is not None:
@@ -534,28 +443,6 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             except:
                 pass
 
-        # Skip entries during very low or very high vol regimes (new)
-        if atr_now is not None and atr_sma is not None:
-            if low_vol or high_vol:
-                state["last_processed_ts"] = ts
-                return state, trade_row
-
-        # Continuation entry: momentum candle + pullback to EMA20
-        bullish_momentum = (price > open_price) and ((price - open_price) > atr_now*0.2 if atr_now else (price - open_price) > 0)
-        bearish_momentum = (price < open_price) and ((open_price - price) > atr_now*0.2 if atr_now else (open_price - price) > 0)
-
-        pullback_long = True
-        pullback_short = True
-        try:
-            pullback_long = price >= h1['EMA20'].iloc[i] - (atr_now*0.3 if atr_now else 0)
-            pullback_short = price <= h1['EMA20'].iloc[i] + (atr_now*0.3 if atr_now else 0)
-        except Exception:
-            pass
-
-        cont_long = bullish_momentum and pullback_long and (h1['EMA20'].iloc[i] > h1['EMA50'].iloc[i])
-        cont_short = bearish_momentum and pullback_short and (h1['EMA20'].iloc[i] < h1['EMA50'].iloc[i])
-
-        # Original sweep logic kept as fallback (Option B)
         bullish_sweep = (price > open_price) and (price > prev_close)
         bearish_sweep = (price < open_price) and (price < prev_close)
 
@@ -571,44 +458,46 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
         rsi_ok_long = True if rsi is None else rsi > RSI_OVERSOLD
         rsi_ok_short = True if rsi is None else rsi < RSI_OVERBOUGHT
 
-        # Combine: prefer continuation, fallback to sweep
-        long_ok = (cont_long or bullish_sweep) and vol_ok_long and rsi_ok_long and ((not USE_H1_FILTER) or h4t == 1)
-        short_ok = (cont_short or bearish_sweep) and vol_ok_short and rsi_ok_short and ((not USE_H1_FILTER) or h4t == -1)
+        long_ok  = bullish_sweep and vol_ok_long  and rsi_ok_long  and ((not USE_H1_FILTER) or h4t == 1)
+        short_ok = bearish_sweep and vol_ok_short and rsi_ok_short and ((not USE_H1_FILTER) or h4t == -1)
 
         signal = 1 if long_ok else (-1 if short_ok else 0)
 
-        if signal != 0 and (not USE_ATR_STOPS or (USE_ATR_STOPS and atr_now is not None and atr_now > 0)):
+        if signal != 0 and (not USE_ATR_STOPS or (USE_ATR_STOPS and not pd.isna(h1['ATR'].iloc[i]) and h1['ATR'].iloc[i] > 0)):
             if signal == 1:
-                sl = price - (ATR_MULT_SL * atr_now) if USE_ATR_STOPS else price * (1 - min(max(price*0.0005,0.0005),0.0015))
+                sl = price - (ATR_MULT_SL * h1['ATR'].iloc[i]) if USE_ATR_STOPS else price * (1 - min(max(price*0.0005,0.0005),0.0015))
                 risk = abs(price - sl)
                 rr = RR_FIXED
-                # dynamic rr (use ATR recent)
+                # ✅ FIX #3: Swapped MIN_RR and MAX_RR logic
                 if DYNAMIC_RR and USE_ATR_STOPS and i >= 6:
-                    recent = float(h1['ATR'].iloc[i-5:i].mean()) if not pd.isna(h1['ATR'].iloc[i-5:i].mean()) else 0
+                    recent = float(h1['ATR'].iloc[i-5:i].mean())
                     curr = float(h1['ATR'].iloc[i])
                     if recent > 0:
-                        if curr > recent*1.2: rr = MAX_RR
-                        elif curr < recent*0.8: rr = MIN_RR
+                        if curr > recent*1.2: rr = MAX_RR  # ✅ High vol = bigger target
+                        elif curr < recent*0.8: rr = MIN_RR  # ✅ Low vol = smaller target
                 tp = price + rr * risk
             else:
-                sl = price + (ATR_MULT_SL * atr_now) if USE_ATR_STOPS else price * (1 + min(max(price*0.0005,0.0005),0.0015))
+                sl = price + (ATR_MULT_SL * h1['ATR'].iloc[i]) if USE_ATR_STOPS else price * (1 + min(max(price*0.0005,0.0005),0.0015))
                 risk = abs(sl - price)
                 rr = RR_FIXED
+                # ✅ FIX #3: Swapped MIN_RR and MAX_RR logic
                 if DYNAMIC_RR and USE_ATR_STOPS and i >= 6:
-                    recent = float(h1['ATR'].iloc[i-5:i].mean()) if not pd.isna(h1['ATR'].iloc[i-5:i].mean()) else 0
+                    recent = float(h1['ATR'].iloc[i-5:i].mean())
                     curr = float(h1['ATR'].iloc[i])
                     if recent > 0:
-                        if curr > recent*1.2: rr = MAX_RR
-                        elif curr < recent*0.8: rr = MIN_RR
+                        if curr > recent*1.2: rr = MAX_RR  # ✅ High vol = bigger target
+                        elif curr < recent*0.8: rr = MIN_RR  # ✅ Low vol = smaller target
                 tp = price - rr * risk
 
             if risk > 0:
+                # ✅ FIX #9: Added MAX_POSITION_PCT parameter
                 size = position_size_futures(price, sl, state["capital"], RISK_PERCENT, MAX_TRADE_SIZE, MAX_POSITION_PCT)
                 if size > 0:
                     entry_price_used = price
                     side = "buy" if signal==1 else "sell"
                     if MODE == "live":
                         try:
+                            # ✅ FIX #11: Round before storing
                             size = amount_to_precision(exchange, symbol, size)
                             order = place_market(exchange, symbol, side, size, reduce_only=False)
                             ep = avg_fill_price(order)
@@ -627,11 +516,8 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                     state["bearish_count"] = 0
                     state["entry_bar_index"] = i  # ✅ FIX #1: Track entry bar
 
-                    # set TP1 (1R) for partial close
-                    state["tp1"] = entry_price_used + (entry_price_used - sl) if signal==1 else entry_price_used - (sl - entry_price_used)
-                    state["tp1_hit"] = False
-
                     pos_val = abs(entry_price_used * size)
+                    # ✅ FIX #4: Removed slippage deduction (already in live fill)
                     state["capital"] -= pos_val*FEE_RATE
 
                     tag = "LONG" if signal==1 else "SHORT"
@@ -801,7 +687,7 @@ def summary_scheduler():
 # =========================
 def main():
     boot = f"""
-🚀 Futures Bot Started (MERGED OPTION B)
+🚀 Futures Bot Started (FIXED VERSION)
 Mode: {MODE.upper()}
 Exchange: KuCoin Futures (perps)
 Symbols: {", ".join(SYMBOLS)}
@@ -831,4 +717,3 @@ Max Position: {MAX_POSITION_PCT*100:.0f}% of capital
 
 if __name__ == "__main__":
     main()
-
