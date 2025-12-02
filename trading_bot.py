@@ -284,77 +284,105 @@ def verify_leverage(exchange, symbol):
 # CORE PER-BAR PROCESSOR
 # =========================
 def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
-    h1 = h1.copy(); h4 = h4.copy()
-    h1['Bias'] = 0
-    h1.loc[h1['Close'] > h1['Close'].shift(1), 'Bias'] = 1
-    h1.loc[h1['Close'] < h1['Close'].shift(1), 'Bias'] = -1
+    """
+    Process one closed H1 bar (h1 contains closed bars; last row = last closed bar).
+    This function updates state and returns (state, trade_row) where trade_row is None
+    unless an exit occurred.
+    """
 
-    h4['Trend'] = 0
-    h4.loc[h4['Close'] > h4['Close'].shift(1), 'Trend'] = 1
-    h4.loc[h4['Close'] < h4['Close'].shift(1), 'Trend'] = -1
+    # defensive copies
+    h1 = h1.copy(); h4 = h4.copy()
+
+    # indicators (defensive - worker also computes but keep here to be safe)
+    if 'Bias' not in h1.columns:
+        h1['Bias'] = 0
+        h1.loc[h1['Close'] > h1['Close'].shift(1), 'Bias'] = 1
+        h1.loc[h1['Close'] < h1['Close'].shift(1), 'Bias'] = -1
+
+    if 'Trend' not in h4.columns:
+        h4['Trend'] = 0
+        h4.loc[h4['Close'] > h4['Close'].shift(1), 'Trend'] = 1
+        h4.loc[h4['Close'] < h4['Close'].shift(1), 'Trend'] = -1
 
     h1['H4_Trend'] = h4['Trend'].reindex(h1.index, method='ffill').fillna(0).astype(int)
 
-    if USE_ATR_STOPS:
+    if USE_ATR_STOPS and 'ATR' not in h1.columns:
         h1['ATR'] = calculate_atr(h1, ATR_PERIOD)
-    if USE_VOLUME_FILTER:
+    if USE_VOLUME_FILTER and 'Avg_Volume' not in h1.columns:
         h1['Avg_Volume'] = h1['Volume'].rolling(VOL_LOOKBACK).mean()
-    h1['RSI'] = calculate_rsi(h1['Close'], RSI_PERIOD)
+    if 'RSI' not in h1.columns:
+        h1['RSI'] = calculate_rsi(h1['Close'], RSI_PERIOD)
 
+    # last closed bar index
     i = len(h1) - 1
+    if i < 0:
+        return state, None
+
     curr = h1.iloc[i]
     prev_close = h1['Close'].iloc[i-1] if i >= 1 else curr['Close']
     price = float(curr['Close']); open_price = float(curr['Open'])
     bias = int(curr['Bias']); h4t = int(curr['H4_Trend'])
     ts = h1.index[i]
 
-    # ✅ FIX #6: Only apply funding on settlement hours
-    bar_hour = ts.hour
-    if bar_hour in [0, 8, 16] and INCLUDE_FUNDING and state["position"] != 0 and funding_series is not None:
+    # funding impact at settlement bar (apply only on typical funding hours)
+    if INCLUDE_FUNDING and state.get("position", 0) != 0 and funding_series is not None:
         try:
+            # funding_series is aligned to h1.index (0 when missing)
             rate = float(funding_series.iloc[i]) if i < len(funding_series) else 0.0
         except Exception:
             rate = 0.0
-        if rate != 0.0 and state["entry_price"] and state["entry_size"]:
+        if rate != 0.0 and state.get("entry_price") and state.get("entry_size"):
             notional = abs(state["entry_price"] * state["entry_size"])
-            fee = notional * rate * (1 if state["position"] == 1 else -1) * (-1)
+            # longs pay when rate>0; shorts receive; apply negative when paid
+            fee = -notional * rate if state["position"] == 1 else notional * rate
             state["capital"] += fee
 
-    state["peak_equity"] = max(state["peak_equity"], state["capital"])
-    dd = (state["peak_equity"] - state["capital"]) / state["peak_equity"] if state["peak_equity"] > 0 else 0.0
-    if dd >= MAX_DRAWDOWN and state["position"] != 0:
+    # update peak equity before drawdown check (same as live)
+    state["peak_equity"] = max(state.get("peak_equity", state.get("capital", PER_COIN_CAP_USD)), state.get("capital", PER_COIN_CAP_USD))
+    dd = (state["peak_equity"] - state.get("capital", 0.0)) / state["peak_equity"] if state.get("peak_equity", 0) > 0 else 0.0
+    if dd >= MAX_DRAWDOWN and state.get("position", 0) != 0:
+        # forced exit due to drawdown
         side = "sell" if state["position"] == 1 else "buy"
         exit_price = price
-        if MODE == "live":
+        if MODE == "live" and exchange is not None:
             try:
                 order = place_market(exchange, symbol, side, amount_to_precision(exchange, symbol, state["entry_size"]), reduce_only=True)
                 exit_price = float(avg_fill_price(order) or price)
             except Exception as e:
                 send_telegram_fut(f"❌ {symbol} forced-exit failed: {e}")
-        gross = state["entry_size"] * (exit_price - state["entry_price"]) * (1 if state["position"]==1 else -1)
-        pos_val = abs(exit_price * state["entry_size"])
-        # ✅ FIX #5: Removed slippage deduction
-        pnl = gross - pos_val*FEE_RATE
+
+        gross = state["entry_size"] * (exit_price - state["entry_price"]) * (1 if state["position"] == 1 else -1)
+        pos_val = abs(exit_price * state["entry_size"]) if state.get("entry_size") else 0.0
+        pnl = gross - pos_val * FEE_RATE
         state["capital"] += pnl
+
         row = {
-            "Symbol": symbol, "Entry_DateTime": state["entry_time"],
-            "Exit_DateTime": ts, "Position": "Long" if state["position"]==1 else "Short",
-            "Entry_Price": round(state["entry_price"],6), "Exit_Price": round(exit_price,6),
-            "Take_Profit": round(state["entry_tp"],6), "Stop_Loss": round(state["entry_sl"],6),
-            "Position_Size_Base": round(state["entry_size"],8),
-            "PnL_$": round(pnl,2), "Win": 1 if pnl>0 else 0,
-            "Exit_Reason": "MAX DRAWDOWN", "Capital_After": round(state["capital"],2), "Mode": MODE
+            "Symbol": symbol, "Entry_DateTime": state.get("entry_time"),
+            "Exit_DateTime": ts, "Position": "Long" if state.get("position") == 1 else "Short",
+            "Entry_Price": round(state.get("entry_price", 0.0), 6), "Exit_Price": round(exit_price, 6),
+            "Take_Profit": round(state.get("entry_tp", 0.0), 6), "Stop_Loss": round(state.get("entry_sl", 0.0), 6),
+            "Position_Size_Base": round(state.get("entry_size", 0.0), 8),
+            "PnL_$": round(pnl, 2), "Win": 1 if pnl > 0 else 0,
+            "Exit_Reason": "MAX DRAWDOWN", "Capital_After": round(state["capital"], 2), "Mode": MODE
         }
-        state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"bearish_count":0,"entry_bar_index":0})
+
+        # reset state properly
+        state.update({"position": 0, "entry_price": 0.0, "entry_sl": 0.0, "entry_tp": 0.0,
+                      "entry_time": None, "entry_size": 0.0, "bearish_count": 0, "entry_bar_index": 0})
         state["last_exit_time"] = ts
+
+        # set last processed to avoid reprocessing same bar
+        state["last_processed_ts"] = ts
+        state["peak_equity"] = max(state.get("peak_equity", state.get("capital")), state.get("capital"))
+
         return state, row
 
     trade_row = None
 
-        # ===== EXIT LOGIC =====
-    if state["position"] != 0:
+    # ===== EXIT LOGIC =====
+    if state.get("position", 0) != 0:
         bars_held = i - state.get("entry_bar_index", 0)
-        
+
         exit_flag = False; exit_reason = ""; exit_price = price
         if state["position"] == 1:
             if price >= state["entry_tp"]:
@@ -376,6 +404,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             else:
                 state["bearish_count"] = 0
         else:
+            # short position exits
             if price <= state["entry_tp"]:
                 exit_flag, exit_price, exit_reason = True, state["entry_tp"], "Take Profit"
                 state["bearish_count"] = 0
@@ -396,55 +425,61 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                 state["bearish_count"] = 0
 
         if exit_flag:
-            side = "sell" if state["position"]==1 else "buy"
-            if MODE == "live":
+            side = "sell" if state["position"] == 1 else "buy"
+            if MODE == "live" and exchange is not None:
                 try:
                     order = place_market(exchange, symbol, side, amount_to_precision(exchange, symbol, state["entry_size"]), reduce_only=True)
                     exit_price = float(avg_fill_price(order) or price)
                 except Exception as e:
                     send_telegram_fut(f"❌ {symbol} exit failed: {e}")
 
-            gross = state["entry_size"] * (exit_price - state["entry_price"]) * (1 if state["position"]==1 else -1)
-            pos_val = abs(exit_price * state["entry_size"])
-            pnl = gross - pos_val*FEE_RATE
+            gross = state["entry_size"] * (exit_price - state["entry_price"]) * (1 if state["position"] == 1 else -1)
+            pos_val = abs(exit_price * state["entry_size"]) if state.get("entry_size") else 0.0
+            pnl = gross - pos_val * FEE_RATE
             state["capital"] += pnl
 
             trade_row = {
-                "Symbol": symbol, "Entry_DateTime": state["entry_time"],
-                "Exit_DateTime": ts, "Position": "Long" if state["position"]==1 else "Short",
-                "Entry_Price": round(state["entry_price"],6), "Exit_Price": round(exit_price,6),
-                "Take_Profit": round(state["entry_tp"],6), "Stop_Loss": round(state["entry_sl"],6),
-                "Position_Size_Base": round(state["entry_size"],8),
-                "PnL_$": round(pnl,2), "Win": 1 if pnl>0 else 0,
-                "Exit_Reason": exit_reason, "Capital_After": round(state["capital"],2), "Mode": MODE
+                "Symbol": symbol, "Entry_DateTime": state.get("entry_time"),
+                "Exit_DateTime": ts, "Position": "Long" if state["position"] == 1 else "Short",
+                "Entry_Price": round(state.get("entry_price", 0.0), 6), "Exit_Price": round(exit_price, 6),
+                "Take_Profit": round(state.get("entry_tp", 0.0), 6), "Stop_Loss": round(state.get("entry_sl", 0.0), 6),
+                "Position_Size_Base": round(state.get("entry_size", 0.0), 8),
+                "PnL_$": round(pnl, 2), "Win": 1 if pnl > 0 else 0,
+                "Exit_Reason": exit_reason, "Capital_After": round(state["capital"], 2), "Mode": MODE
             }
-            state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"entry_bar_index":0})
+
+            # reset state properly
+            state.update({"position": 0, "entry_price": 0.0, "entry_sl": 0.0, "entry_tp": 0.0,
+                          "entry_time": None, "entry_size": 0.0, "entry_bar_index": 0})
             state["last_exit_time"] = ts
 
-            emoji = "💚" if pnl>0 else "❤️"
-            send_telegram_fut(f"{emoji} EXIT {symbol} {exit_reason} @ {exit_price:.4f} | PnL ${pnl:.2f}")
-            
-            # ✅ ✅ ✅ CRITICAL FIX: RETURN IMMEDIATELY AFTER EXIT! ✅ ✅ ✅
+            # prevent same-bar re-entry: mark last_processed_ts BEFORE returning
             state["last_processed_ts"] = ts
-            state["peak_equity"] = max(state["peak_equity"], state["capital"])
-            return state, trade_row  # ← THIS LINE PREVENTS SAME-BAR RE-ENTRY!
+            state["peak_equity"] = max(state.get("peak_equity", state.get("capital")), state.get("capital"))
+
+            emoji = "💚" if pnl > 0 else "❤️"
+            send_telegram_fut(f"{emoji} EXIT {symbol} {exit_reason} @ {exit_price:.4f} | PnL ${pnl:.2f}")
+
+            return state, trade_row
 
     # ===== ENTRY LOGIC =====
     # This section will ONLY run if we didn't exit above!
-    if state["position"] == 0:
-        # ... rest of entry logic ...
-
-        # ✅ FIX #10: Improved cooldown handling
-        if COOLDOWN_HOURS>0 and state.get("last_exit_time") is not None:
+    if state.get("position", 0) == 0:
+        # cooldown check (immediate return if in cooldown)
+        if COOLDOWN_HOURS > 0 and state.get("last_exit_time") is not None:
             last_exit = state["last_exit_time"]
             if isinstance(last_exit, str):
-                last_exit = pd.to_datetime(last_exit).tz_localize(None)
+                try:
+                    last_exit = pd.to_datetime(last_exit).tz_localize(None)
+                except Exception:
+                    last_exit = None
             try:
-                hours_since = (ts - last_exit).total_seconds() / 3600
-                if hours_since < COOLDOWN_HOURS:
-                    state["last_processed_ts"] = ts
-                    return state, trade_row
-            except:
+                if last_exit is not None:
+                    hours_since = (ts - last_exit).total_seconds() / 3600
+                    if hours_since < COOLDOWN_HOURS:
+                        state["last_processed_ts"] = ts
+                        return state, trade_row
+            except Exception:
                 pass
 
         bullish_sweep = (price > open_price) and (price > prev_close)
@@ -462,74 +497,85 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
         rsi_ok_long = True if rsi is None else rsi > RSI_OVERSOLD
         rsi_ok_short = True if rsi is None else rsi < RSI_OVERBOUGHT
 
-        long_ok  = bullish_sweep and vol_ok_long  and rsi_ok_long  and ((not USE_H1_FILTER) or h4t == 1)
+        long_ok = bullish_sweep and vol_ok_long and rsi_ok_long and ((not USE_H1_FILTER) or h4t == 1)
         short_ok = bearish_sweep and vol_ok_short and rsi_ok_short and ((not USE_H1_FILTER) or h4t == -1)
 
         signal = 1 if long_ok else (-1 if short_ok else 0)
 
         if signal != 0 and (not USE_ATR_STOPS or (USE_ATR_STOPS and not pd.isna(h1['ATR'].iloc[i]) and h1['ATR'].iloc[i] > 0)):
+            # compute sl, tp, risk, rr exactly as before
             if signal == 1:
-                sl = price - (ATR_MULT_SL * h1['ATR'].iloc[i]) if USE_ATR_STOPS else price * (1 - min(max(price*0.0005,0.0005),0.0015))
+                sl = price - (ATR_MULT_SL * h1['ATR'].iloc[i]) if USE_ATR_STOPS else price * (1 - min(max(price * 0.0005, 0.0005), 0.0015))
                 risk = abs(price - sl)
                 rr = RR_FIXED
-                # ✅ FIX #3: Swapped MIN_RR and MAX_RR logic
                 if DYNAMIC_RR and USE_ATR_STOPS and i >= 6:
                     recent = float(h1['ATR'].iloc[i-5:i].mean())
                     curr = float(h1['ATR'].iloc[i])
                     if recent > 0:
-                        if curr > recent*1.2: rr = MAX_RR  # ✅ High vol = bigger target
-                        elif curr < recent*0.8: rr = MIN_RR  # ✅ Low vol = smaller target
+                        if curr > recent * 1.2:
+                            rr = MAX_RR
+                        elif curr < recent * 0.8:
+                            rr = MIN_RR
                 tp = price + rr * risk
             else:
-                sl = price + (ATR_MULT_SL * h1['ATR'].iloc[i]) if USE_ATR_STOPS else price * (1 + min(max(price*0.0005,0.0005),0.0015))
+                sl = price + (ATR_MULT_SL * h1['ATR'].iloc[i]) if USE_ATR_STOPS else price * (1 + min(max(price * 0.0005, 0.0005), 0.0015))
                 risk = abs(sl - price)
                 rr = RR_FIXED
-                # ✅ FIX #3: Swapped MIN_RR and MAX_RR logic
                 if DYNAMIC_RR and USE_ATR_STOPS and i >= 6:
                     recent = float(h1['ATR'].iloc[i-5:i].mean())
                     curr = float(h1['ATR'].iloc[i])
                     if recent > 0:
-                        if curr > recent*1.2: rr = MAX_RR  # ✅ High vol = bigger target
-                        elif curr < recent*0.8: rr = MIN_RR  # ✅ Low vol = smaller target
+                        if curr > recent * 1.2:
+                            rr = MAX_RR
+                        elif curr < recent * 0.8:
+                            rr = MIN_RR
                 tp = price - rr * risk
 
             if risk > 0:
-                # ✅ FIX #9: Added MAX_POSITION_PCT parameter
                 size = position_size_futures(price, sl, state["capital"], RISK_PERCENT, MAX_TRADE_SIZE, MAX_POSITION_PCT)
                 if size > 0:
                     entry_price_used = price
-                    side = "buy" if signal==1 else "sell"
-                    if MODE == "live":
+                    side = "buy" if signal == 1 else "sell"
+                    if MODE == "live" and exchange is not None:
                         try:
-                            # ✅ FIX #11: Round before storing
                             size = amount_to_precision(exchange, symbol, size)
                             order = place_market(exchange, symbol, side, size, reduce_only=False)
                             ep = avg_fill_price(order)
-                            if ep is not None: entry_price_used = float(ep)
+                            if ep is not None:
+                                entry_price_used = float(ep)
                         except Exception as e:
                             send_telegram_fut(f"❌ {symbol} entry failed: {e}")
+                            # mark processed to avoid immediate re-trigger
                             state["last_processed_ts"] = ts
                             return state, trade_row
 
-                    state["position"] = 1 if signal==1 else -1
+                    # set position state
+                    state["position"] = 1 if signal == 1 else -1
                     state["entry_price"] = entry_price_used
                     state["entry_sl"] = sl
                     state["entry_tp"] = tp
                     state["entry_time"] = ts
                     state["entry_size"] = size
+                    state["entry_bar_index"] = i
                     state["bearish_count"] = 0
-                    state["entry_bar_index"] = i  # ✅ FIX #1: Track entry bar
 
+                    # critical: mark bar processed right away to prevent re-entry
+                    state["last_processed_ts"] = ts
+
+                    # DO NOT save state here (worker will save). We only update in-memory state.
+
+                    # deduct fees (entry)
                     pos_val = abs(entry_price_used * size)
-                    # ✅ FIX #4: Removed slippage deduction (already in live fill)
-                    state["capital"] -= pos_val*FEE_RATE
+                    state["capital"] -= pos_val * FEE_RATE
 
-                    tag = "LONG" if signal==1 else "SHORT"
+                    tag = "LONG" if signal == 1 else "SHORT"
                     send_telegram_fut(f"🚀 ENTRY {symbol} {tag} @ {entry_price_used:.4f} | SL {sl:.4f} | TP {tp:.4f} | RR {rr:.1f}")
 
+    # final housekeeping - mark processed and update peak equity
     state["last_processed_ts"] = ts
-    state["peak_equity"] = max(state["peak_equity"], state["capital"])
+    state["peak_equity"] = max(state.get("peak_equity", state.get("capital", PER_COIN_CAP_USD)), state.get("capital", PER_COIN_CAP_USD))
     return state, trade_row
+
 
 # =========================
 # WORKER THREAD
@@ -721,3 +767,5 @@ Max Position: {MAX_POSITION_PCT*100:.0f}% of capital
 
 if __name__ == "__main__":
     main()
+
+
